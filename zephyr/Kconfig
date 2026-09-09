@@ -1,0 +1,3 @@
+
+config PHOSPHOR_USER_MANAGER
+    bool "openbmc phosphor-user-manager"

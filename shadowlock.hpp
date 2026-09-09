@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef __ZEPHYR__
 #include <shadow.h>
+#endif
 #include <stdio.h>
 
 #include <phosphor-logging/elog-errors.hpp>
