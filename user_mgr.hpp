@@ -81,6 +81,15 @@ template <typename... ArgTypes>
 std::vector<std::string> executeCmd(const char* path, ArgTypes&&... tArgs)
 {
     std::vector<std::string> stdOutput;
+#ifdef __ZEPHYR__
+    // Zephyr: external commands (fork/exec via boost::process) are not
+    // available.  The user management code paths are replaced by the local
+    // users.json store; no command is spawned and no output is produced.
+    // TODO(zephyr-unhandled): report a failure through the caller if a future
+    // Zephyr path still depends on the command output/exit code.
+    (void)path;
+    return stdOutput;
+#else
     boost::process::ipstream stdOutStream;
     boost::process::child execProg(path, const_cast<char*>(tArgs)...,
                                    boost::process::std_out > stdOutStream);
@@ -104,6 +113,7 @@ std::vector<std::string> executeCmd(const char* path, ArgTypes&&... tArgs)
     }
 
     return stdOutput;
+#endif
 }
 
 /** @class UserMgr

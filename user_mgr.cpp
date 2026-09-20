@@ -24,7 +24,9 @@
 
 #include <grp.h>
 #include <pwd.h>
+#ifndef __ZEPHYR__
 #include <shadow.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -47,6 +49,18 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef __ZEPHYR__
+#include <nlohmann/json.hpp>
+#include <openssl/aes.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <sstream>
+#endif
 
 namespace phosphor
 {
@@ -315,6 +329,609 @@ void UserMgr::throwForInvalidGroups(const std::vector<std::string>& groupNames)
     }
 }
 
+#ifdef __ZEPHYR__
+// ---------------------------------------------------------------------------
+// Zephyr local user store.
+//
+// Zephyr has no /etc/passwd|shadow|group, no NSS and no PAM.  Reference:
+// origin/zephyr keeps the account data in a users.json file plus a small
+// SHA256/AES password store; the same approach is used here, but the Linux
+// code paths above stay untouched.
+//
+// File layout (compatible with origin/zephyr's config/users.json):
+//   userList: [ { userId, userName, passWordHASH, passWordAES, priv,
+//                 groupList, expireTime, enable, pwdUpdateTime,
+//                 lockStatus, failTimes, lockTime }, ... ]
+//   userRule: { gExpireTime, minlen, remember, deny, unlock_time, autoLock,
+//               newUserId }
+//               (policy keys reuse the Linux PAM argument names)
+//   createdGroups: [ locally created groups ] (/etc/group equivalent)
+// ---------------------------------------------------------------------------
+namespace
+{
+using json = nlohmann::json;
+
+constexpr const char* zephyrUsersFile =
+    CONFIG_FS_ROOT_OVERLAY "/etc/users.json";
+constexpr const char* zephyrAesKey = "thisisaverysecretkey012345678912";
+constexpr const char* zephyrDefaultPassword = "0penBmc";
+constexpr int64_t zephyrNeverExpireDays = 99999;
+constexpr int zephyrDefaultMinPasswordLength = 8;
+constexpr int zephyrDefaultRememberOldPasswordTimes = 0;
+constexpr int zephyrDefaultLockDeny = 3;
+constexpr int zephyrDefaultUnlockTime = 900;
+constexpr uint64_t zephyrFirstUserId = 1000;
+constexpr int64_t zephyrSecondsPerDay = 24 * 60 * 60;
+
+// users.json keys.  The on-disk names stay compatible with origin/zephyr's
+// config/users.json; always use these constants instead of raw string
+// literals so read/write sides cannot drift apart.
+// NOTE: the Linux PAM argument constants above (e.g. unlockTimeout ==
+// "unlock_time") are a different layer and must not be confused with these
+// users.json keys.
+namespace zephyrJson
+{
+// top level
+constexpr const char* userList = "userList";
+constexpr const char* userRule = "userRule";
+// Locally created groups (the /etc/group equivalent: group existence).
+constexpr const char* createdGroups = "createdGroups";
+// user entry (userList[])
+constexpr const char* userId = "userId";
+constexpr const char* userName = "userName";
+constexpr const char* passWordHash = "passWordHASH";
+constexpr const char* passWordAes = "passWordAES";
+constexpr const char* priv = "priv";
+constexpr const char* userGroupList = "groupList";
+constexpr const char* expireTime = "expireTime";
+constexpr const char* enable = "enable";
+constexpr const char* pwdUpdateTime = "pwdUpdateTime";
+constexpr const char* lockStatus = "lockStatus";
+constexpr const char* failTimes = "failTimes";
+constexpr const char* lockTime = "lockTime";
+// userRule
+constexpr const char* gExpireTime = "gExpireTime";
+// The account policy keys reuse the Linux PAM argument constants instead of
+// private json key names:
+//   minPasswdLenProp ("minlen")     <- minPasswordLength
+//   remOldPasswdCount ("remember")  <- rememberOldPasswordTimes
+//   maxFailedAttempt ("deny")       <- maxLoginAttemptBeforeLockout
+//   unlockTimeout ("unlock_time")   <- accountUnlockTimeout
+constexpr const char* autoLock = "autoLock";
+constexpr const char* newUserId = "newUserId";
+} // namespace zephyrJson
+
+json zephyrStore;
+
+std::string zephyrSha256(const std::string& str)
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, str.c_str(), str.size());
+    SHA256_Final(hash, &ctx);
+
+    std::stringstream ss;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    {
+        ss << std::hex << std::setw(2) << std::setfill('0')
+           << static_cast<int>(hash[i]);
+    }
+    return ss.str();
+}
+
+std::string zephyrBase64Encode(const unsigned char* data, int len)
+{
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO* bio = BIO_new(BIO_s_mem());
+    bio = BIO_push(b64, bio);
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(bio, data, len);
+    BIO_flush(bio);
+
+    BUF_MEM* bufferPtr = nullptr;
+    BIO_get_mem_ptr(bio, &bufferPtr);
+    std::string result(bufferPtr->data, bufferPtr->length);
+    BIO_free_all(bio);
+    return result;
+}
+
+std::string zephyrBase64Decode(const std::string& encoded)
+{
+    std::vector<char> decoded(encoded.size());
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO* bio = BIO_new_mem_buf(encoded.data(), encoded.size());
+    bio = BIO_push(b64, bio);
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    int len = BIO_read(bio, decoded.data(), decoded.size());
+    BIO_free_all(bio);
+    return (len > 0) ? std::string(decoded.data(), len) : std::string{};
+}
+
+std::string zephyrAesEncrypt(const std::string& plaintext)
+{
+    std::string key(zephyrAesKey);
+    if (key.size() != 32)
+    {
+        return {};
+    }
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr)
+    {
+        return {};
+    }
+
+    std::vector<unsigned char> ciphertext(plaintext.size() + 16);
+    int len = 0;
+    int finalLen = 0;
+    std::string result;
+    if ((EVP_EncryptInit_ex(
+             ctx, EVP_aes_256_ecb(), nullptr,
+             reinterpret_cast<const unsigned char*>(key.data()), nullptr) == 1) &&
+        (EVP_EncryptUpdate(
+             ctx, ciphertext.data(), &len,
+             reinterpret_cast<const unsigned char*>(plaintext.data()),
+             plaintext.size()) == 1) &&
+        (EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &finalLen) == 1))
+    {
+        result = zephyrBase64Encode(ciphertext.data(), len + finalLen);
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return result;
+}
+
+// TODO(zephyr-unhandled): used by the password verification path once the
+// web/ssh/IPMI authentication is wired to the local store.
+[[maybe_unused]] std::string zephyrAesDecrypt(const std::string& ciphertextB64)
+{
+    std::string key(zephyrAesKey);
+    std::string ciphertext = zephyrBase64Decode(ciphertextB64);
+    if ((key.size() != 32) || ciphertext.empty() ||
+        (ciphertext.size() % 16 != 0))
+    {
+        return {};
+    }
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr)
+    {
+        return {};
+    }
+
+    std::vector<unsigned char> plaintext(ciphertext.size() + 16);
+    int len = 0;
+    int finalLen = 0;
+    std::string result;
+    if ((EVP_DecryptInit_ex(
+             ctx, EVP_aes_256_ecb(), nullptr,
+             reinterpret_cast<const unsigned char*>(key.data()), nullptr) == 1) &&
+        (EVP_DecryptUpdate(
+             ctx, plaintext.data(), &len,
+             reinterpret_cast<const unsigned char*>(ciphertext.data()),
+             ciphertext.size()) == 1) &&
+        (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &finalLen) == 1))
+    {
+        result.assign(reinterpret_cast<char*>(plaintext.data()), len + finalLen);
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return result;
+}
+
+json& zephyrUserRule()
+{
+    if (!zephyrStore.contains(zephyrJson::userRule) ||
+        !zephyrStore[zephyrJson::userRule].is_object())
+    {
+        zephyrStore[zephyrJson::userRule] = json::object();
+    }
+    json& rule = zephyrStore[zephyrJson::userRule];
+    if (!rule.contains(zephyrJson::gExpireTime))
+    {
+        rule[zephyrJson::gExpireTime] = zephyrNeverExpireDays;
+    }
+    if (!rule.contains(minPasswdLenProp))
+    {
+        rule[minPasswdLenProp] = zephyrDefaultMinPasswordLength;
+    }
+    if (!rule.contains(remOldPasswdCount))
+    {
+        rule[remOldPasswdCount] = zephyrDefaultRememberOldPasswordTimes;
+    }
+    if (!rule.contains(maxFailedAttempt))
+    {
+        rule[maxFailedAttempt] = zephyrDefaultLockDeny;
+    }
+    if (!rule.contains(unlockTimeout))
+    {
+        rule[unlockTimeout] = zephyrDefaultUnlockTime;
+    }
+    if (!rule.contains(zephyrJson::autoLock))
+    {
+        rule[zephyrJson::autoLock] = true;
+    }
+    if (!rule.contains(zephyrJson::newUserId))
+    {
+        rule[zephyrJson::newUserId] = zephyrFirstUserId;
+    }
+    return rule;
+}
+
+bool zephyrSaveStore()
+{
+    std::ofstream out(zephyrUsersFile, std::ios::out | std::ios::trunc);
+    if (!out.is_open())
+    {
+        // TODO(zephyr-unhandled): mkdir/seed the overlay directory if the
+        // image does not provide CONFIG_FS_ROOT_OVERLAY"/etc".
+        // The failure is logged once by the operation level caller, so no
+        // extra log here (avoids duplicate messages like Linux's
+        // executeCmd() + caller pair).
+        return false;
+    }
+    out << zephyrStore.dump(4);
+    out.flush();
+    return !out.fail();
+}
+
+void zephyrLoadStore()
+{
+    zephyrStore = json::object();
+    zephyrStore[zephyrJson::userList] = json::array();
+    zephyrUserRule();
+
+    std::ifstream in(zephyrUsersFile, std::ios::in);
+    if (!in.is_open())
+    {
+        // First boot: no account is pre-seeded, create the (empty) store.
+        if (!zephyrSaveStore())
+        {
+            lg2::error("Unable to create local user store {FILENAME}",
+                       "FILENAME", zephyrUsersFile);
+        }
+        return;
+    }
+    try
+    {
+        zephyrStore = json::parse(std::string(std::istreambuf_iterator<char>(in),
+                                              std::istreambuf_iterator<char>()));
+        if (!zephyrStore.is_object())
+        {
+            lg2::error("Invalid top level in {FILENAME}, resetting",
+                       "FILENAME", zephyrUsersFile);
+            zephyrStore = json::object();
+        }
+        if (!zephyrStore.contains(zephyrJson::userList) ||
+            !zephyrStore[zephyrJson::userList].is_array())
+        {
+            zephyrStore[zephyrJson::userList] = json::array();
+        }
+        zephyrUserRule();
+    }
+    catch (const std::exception& e)
+    {
+        lg2::error("Failed to parse {FILENAME}: {ERR}", "FILENAME",
+                   zephyrUsersFile, "ERR", e);
+        zephyrStore = json::object();
+        zephyrStore[zephyrJson::userList] = json::array();
+        zephyrUserRule();
+    }
+}
+
+// Non-throwing typed readers.  A malformed users.json must not let a
+// nlohmann::json exception escape into the sd-bus callbacks (those only
+// translate InternalFailure), so these log and fall back to the default,
+// mirroring origin/zephyr's try/catch(json::exception) handling.
+int64_t zephyrJsonInt(const json& obj, const char* key, int64_t defaultValue)
+{
+    try
+    {
+        return obj.value(key, defaultValue);
+    }
+    catch (const json::exception& e)
+    {
+        lg2::error("Invalid '{KEY}' in local user store: {ERR}", "KEY", key,
+                   "ERR", e);
+        return defaultValue;
+    }
+}
+
+bool zephyrJsonBool(const json& obj, const char* key, bool defaultValue)
+{
+    try
+    {
+        return obj.value(key, defaultValue);
+    }
+    catch (const json::exception& e)
+    {
+        lg2::error("Invalid '{KEY}' in local user store: {ERR}", "KEY", key,
+                   "ERR", e);
+        return defaultValue;
+    }
+}
+
+std::string zephyrJsonString(const json& obj, const char* key,
+                             const std::string& defaultValue = std::string{})
+{
+    try
+    {
+        return obj.value(key, defaultValue);
+    }
+    catch (const json::exception& e)
+    {
+        lg2::error("Invalid '{KEY}' in local user store: {ERR}", "KEY", key,
+                   "ERR", e);
+        return defaultValue;
+    }
+}
+
+json* zephyrFindUser(const std::string& userName)
+{
+    for (auto& user : zephyrStore[zephyrJson::userList])
+    {
+        if (!user.is_object())
+        {
+            continue;
+        }
+        if (zephyrJsonString(user, zephyrJson::userName) == userName)
+        {
+            return &user;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<std::string> zephyrStringList(const json& value)
+{
+    std::vector<std::string> result;
+    if (value.is_array())
+    {
+        for (const auto& item : value)
+        {
+            if (item.is_string())
+            {
+                result.emplace_back(item.get<std::string>());
+            }
+        }
+    }
+    return result;
+}
+
+bool zephyrAddUser(const std::string& userName,
+                   const std::vector<std::string>& groupNames,
+                   const std::string& priv, bool enabled)
+{
+    if (zephyrFindUser(userName) != nullptr)
+    {
+        return false;
+    }
+    json& rule = zephyrUserRule();
+    uint64_t userId = static_cast<uint64_t>(zephyrJsonInt(
+        rule, zephyrJson::newUserId, static_cast<int64_t>(zephyrFirstUserId)));
+    rule[zephyrJson::newUserId] = userId + 1;
+
+    json user;
+    user[zephyrJson::userId] = userId;
+    user[zephyrJson::userName] = userName;
+    // TODO(zephyr-unhandled): no password setting D-Bus API / PAM in Zephyr,
+    // new accounts get the factory default password until the account
+    // management UI provides a local password path.
+    user[zephyrJson::passWordHash] = zephyrSha256(zephyrDefaultPassword);
+    user[zephyrJson::passWordAes] = zephyrAesEncrypt(zephyrDefaultPassword);
+    user[zephyrJson::priv] = priv;
+    user[zephyrJson::userGroupList] = groupNames;
+    user[zephyrJson::expireTime] =
+        zephyrJsonInt(rule, zephyrJson::gExpireTime, zephyrNeverExpireDays);
+    user[zephyrJson::enable] = enabled;
+    user[zephyrJson::pwdUpdateTime] = static_cast<int64_t>(std::time(nullptr));
+    user[zephyrJson::lockStatus] = false;
+    user[zephyrJson::failTimes] = 0;
+    user[zephyrJson::lockTime] = static_cast<uint64_t>(std::time(nullptr));
+    zephyrStore[zephyrJson::userList].push_back(std::move(user));
+    return zephyrSaveStore();
+}
+
+bool zephyrRemoveUser(const std::string& userName)
+{
+    auto& users = zephyrStore[zephyrJson::userList];
+    for (auto it = users.begin(); it != users.end(); ++it)
+    {
+        if (!it->is_object())
+        {
+            continue;
+        }
+        if (zephyrJsonString(*it, zephyrJson::userName) == userName)
+        {
+            users.erase(it);
+            return zephyrSaveStore();
+        }
+    }
+    return false;
+}
+
+bool zephyrRenameUser(const std::string& userName,
+                      const std::string& newUserName)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return false;
+    }
+    (*user)[zephyrJson::userName] = newUserName;
+    return zephyrSaveStore();
+}
+
+bool zephyrSetUserGroups(const std::string& userName,
+                         const std::vector<std::string>& groupNames)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return false;
+    }
+    (*user)[zephyrJson::userGroupList] = groupNames;
+    return zephyrSaveStore();
+}
+
+bool zephyrSetUserPrivilege(const std::string& userName,
+                            const std::string& priv)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return false;
+    }
+    (*user)[zephyrJson::priv] = priv;
+    return zephyrSaveStore();
+}
+
+bool zephyrSetUserEnabled(const std::string& userName, bool enabled)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return false;
+    }
+    (*user)[zephyrJson::enable] = enabled;
+    return zephyrSaveStore();
+}
+
+bool zephyrGetUserBool(const std::string& userName, const char* key,
+                       bool defaultValue)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return defaultValue;
+    }
+    return zephyrJsonBool(*user, key, defaultValue);
+}
+
+int zephyrGetFailCount(const std::string& userName)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return -1;
+    }
+    return static_cast<int>(
+        zephyrJsonInt(*user, zephyrJson::failTimes, 0));
+}
+
+bool zephyrSetFailCount(const std::string& userName, int count)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return false;
+    }
+    (*user)[zephyrJson::failTimes] = count;
+    (*user)[zephyrJson::lockStatus] = false;
+    return zephyrSaveStore();
+}
+
+int64_t zephyrGetLockTime(const std::string& userName)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return 0;
+    }
+    return zephyrJsonInt(*user, zephyrJson::lockTime, 0);
+}
+
+bool zephyrAddGroup(const std::string& groupName)
+{
+    if (!zephyrStore.contains(zephyrJson::createdGroups) ||
+        !zephyrStore[zephyrJson::createdGroups].is_array())
+    {
+        zephyrStore[zephyrJson::createdGroups] = json::array();
+    }
+    auto& groups = zephyrStore[zephyrJson::createdGroups];
+    if (std::find(groups.begin(), groups.end(), groupName) != groups.end())
+    {
+        return true;
+    }
+    groups.push_back(groupName);
+    return zephyrSaveStore();
+}
+
+bool zephyrRemoveGroup(const std::string& groupName)
+{
+    // Groups are local state only; remove it from the store and drop the
+    // membership from every local account.
+    const auto removeFromArray = [&groupName](json& array) {
+        if (array.is_array())
+        {
+            array.erase(std::remove(array.begin(), array.end(), groupName),
+                        array.end());
+        }
+    };
+    if (zephyrStore.contains(zephyrJson::createdGroups))
+    {
+        removeFromArray(zephyrStore[zephyrJson::createdGroups]);
+    }
+    for (auto& user : zephyrStore[zephyrJson::userList])
+    {
+        if (!user.is_object())
+        {
+            continue;
+        }
+        auto groupNames =
+            zephyrStringList(user.value(zephyrJson::userGroupList, json()));
+        const auto it =
+            std::remove(groupNames.begin(), groupNames.end(), groupName);
+        groupNames.erase(it, groupNames.end());
+        user[zephyrJson::userGroupList] = groupNames;
+    }
+    return zephyrSaveStore();
+}
+
+std::vector<std::string> zephyrCollectGroups()
+{
+    std::vector<std::string> groups = {predefinedGroups.begin(),
+                                       predefinedGroups.end()};
+    // Linux enumerates /etc/group and keeps only the dynamic Redfish groups
+    // (names starting with allowedGroupPrefix).  The local store plays the
+    // role of /etc/group here, so apply the same prefix filter.
+    // createdGroups is deduplicated on write (zephyrAddGroup) and cannot
+    // collide with the predefined groups (createGroup validates the name), so
+    // no post-sort is needed; deduplicate while appending instead, keeping the
+    // Linux order (predefined first, then the group store order).
+    const auto appendAllowedGroup = [&groups](const std::string& group) {
+        if (std::find(groups.begin(), groups.end(), group) != groups.end())
+        {
+            return;
+        }
+        for (std::string_view prefix : allowedGroupPrefix)
+        {
+            if (group.starts_with(prefix))
+            {
+                groups.emplace_back(group);
+                return;
+            }
+        }
+    };
+    if (zephyrStore.contains(zephyrJson::createdGroups) &&
+        zephyrStore[zephyrJson::createdGroups].is_array())
+    {
+        for (const auto& group : zephyrStore[zephyrJson::createdGroups])
+        {
+            if (group.is_string())
+            {
+                appendAllowedGroup(group.get<std::string>());
+            }
+        }
+    }
+    return groups;
+}
+} // namespace
+
+std::vector<std::string> UserMgr::readAllGroupsOnSystem()
+{
+    return zephyrCollectGroups();
+}
+#else
 std::vector<std::string> UserMgr::readAllGroupsOnSystem()
 {
     std::vector<std::string> allGroups = {predefinedGroups.begin(),
@@ -338,6 +955,7 @@ std::vector<std::string> UserMgr::readAllGroupsOnSystem()
     endgrent();
     return allGroups;
 }
+#endif
 
 void UserMgr::createUser(std::string userName,
                          std::vector<std::string> groupNames, std::string priv,
@@ -577,6 +1195,19 @@ uint8_t UserMgr::minPasswordLength(uint8_t value)
             Argument::ARGUMENT_NAME("minPasswordLength"),
             Argument::ARGUMENT_VALUE(std::to_string(value).c_str()));
     }
+#ifdef __ZEPHYR__
+    // Zephyr: account policy lives in the local users.json store, not in
+    // /etc/pam.d/common-password.
+    // Zephyr: pam_cracklib minlen is replaced by userRule.minlen (same name as
+    // the Linux PAM argument, see minPasswdLenProp).
+    zephyrUserRule()[minPasswdLenProp] = value;
+    if (!zephyrSaveStore())
+    {
+        lg2::error("Unable to set minPasswordLength to {VALUE}", "VALUE",
+                   value);
+        elog<InternalFailure>();
+    }
+#else
     if (setPamModuleArgValue(pamCrackLib, minPasswdLenProp,
                              std::to_string(value)) != success)
     {
@@ -584,6 +1215,7 @@ uint8_t UserMgr::minPasswordLength(uint8_t value)
                    value);
         elog<InternalFailure>();
     }
+#endif
     return AccountPolicyIface::minPasswordLength(value);
 }
 
@@ -593,6 +1225,18 @@ uint8_t UserMgr::rememberOldPasswordTimes(uint8_t value)
     {
         return value;
     }
+#ifdef __ZEPHYR__
+    // Zephyr: account policy lives in the local users.json store.
+    // Zephyr: pam_pwhistory remember is replaced by userRule.remember (same
+    // name as the Linux PAM argument, see remOldPasswdCount).
+    zephyrUserRule()[remOldPasswdCount] = value;
+    if (!zephyrSaveStore())
+    {
+        lg2::error("Unable to set rememberOldPasswordTimes to {VALUE}", "VALUE",
+                   value);
+        elog<InternalFailure>();
+    }
+#else
     if (setPamModuleArgValue(pamPWHistory, remOldPasswdCount,
                              std::to_string(value)) != success)
     {
@@ -600,6 +1244,7 @@ uint8_t UserMgr::rememberOldPasswordTimes(uint8_t value)
                    value);
         elog<InternalFailure>();
     }
+#endif
     return AccountPolicyIface::rememberOldPasswordTimes(value);
 }
 
@@ -609,6 +1254,17 @@ uint16_t UserMgr::maxLoginAttemptBeforeLockout(uint16_t value)
     {
         return value;
     }
+#ifdef __ZEPHYR__
+    // Zephyr: pam_tally2 deny is replaced by userRule.deny (same name as the
+    // Linux PAM argument, see maxFailedAttempt).
+    zephyrUserRule()[maxFailedAttempt] = value;
+    if (!zephyrSaveStore())
+    {
+        lg2::error("Unable to set maxLoginAttemptBeforeLockout to {VALUE}",
+                   "VALUE", value);
+        elog<InternalFailure>();
+    }
+#else
     if (setPamModuleArgValue(pamTally2, maxFailedAttempt,
                              std::to_string(value)) != success)
     {
@@ -616,6 +1272,7 @@ uint16_t UserMgr::maxLoginAttemptBeforeLockout(uint16_t value)
                    "VALUE", value);
         elog<InternalFailure>();
     }
+#endif
     return AccountPolicyIface::maxLoginAttemptBeforeLockout(value);
 }
 
@@ -625,6 +1282,17 @@ uint32_t UserMgr::accountUnlockTimeout(uint32_t value)
     {
         return value;
     }
+#ifdef __ZEPHYR__
+    // Zephyr: pam_tally2 unlock_time is replaced by userRule.unlock_time
+    // (same name as the Linux PAM argument, see unlockTimeout).
+    zephyrUserRule()[unlockTimeout] = value;
+    if (!zephyrSaveStore())
+    {
+        lg2::error("Unable to set accountUnlockTimeout to {VALUE}", "VALUE",
+                   value);
+        elog<InternalFailure>();
+    }
+#else
     if (setPamModuleArgValue(pamTally2, unlockTimeout, std::to_string(value)) !=
         success)
     {
@@ -632,6 +1300,7 @@ uint32_t UserMgr::accountUnlockTimeout(uint32_t value)
                    value);
         elog<InternalFailure>();
     }
+#endif
     return AccountPolicyIface::accountUnlockTimeout(value);
 }
 
@@ -639,6 +1308,14 @@ int UserMgr::getPamModuleArgValue(const std::string& moduleName,
                                   const std::string& argName,
                                   std::string& argValue)
 {
+#ifdef __ZEPHYR__
+    // TODO(zephyr-unhandled): PAM configuration files do not exist on Zephyr.
+    // The account policy is stored in users.json (see zephyrUserRule()).
+    (void)moduleName;
+    (void)argName;
+    (void)argValue;
+    return failure;
+#else
     std::string fileName;
     if (moduleName == pamTally2)
     {
@@ -686,12 +1363,21 @@ int UserMgr::getPamModuleArgValue(const std::string& moduleName,
         }
     }
     return failure;
+#endif
 }
 
 int UserMgr::setPamModuleArgValue(const std::string& moduleName,
                                   const std::string& argName,
                                   const std::string& argValue)
 {
+#ifdef __ZEPHYR__
+    // TODO(zephyr-unhandled): PAM configuration files do not exist on Zephyr.
+    // The account policy is stored in users.json (see zephyrUserRule()).
+    (void)moduleName;
+    (void)argName;
+    (void)argValue;
+    return failure;
+#else
     std::string fileName;
     if (moduleName == pamTally2)
     {
@@ -756,6 +1442,7 @@ int UserMgr::setPamModuleArgValue(const std::string& moduleName,
         }
     }
     return failure;
+#endif
 }
 
 void UserMgr::userEnable(const std::string& userName, bool enabled)
@@ -791,6 +1478,48 @@ static constexpr size_t t2FailDateIdx = 2;
 static constexpr size_t t2FailTimeIdx = 3;
 static constexpr size_t t2OutputIndex = 1;
 
+#ifdef __ZEPHYR__
+bool UserMgr::userLockedForFailedAttempt(const std::string& userName)
+{
+    // Zephyr: the pam_tally2 counter is replaced by failTimes/lockTime in the
+    // local users.json store (userRule.deny / userRule.unlock_time).
+    const int failAttempts = zephyrGetFailCount(userName);
+    if (failAttempts < 0)
+    {
+        // Unknown user: report "not locked".
+        // TODO(zephyr-unhandled): Linux returns a D-Bus InternalFailure when
+        // pam_tally2 cannot be queried; align once the local account store is
+        // authoritative for every consumer.
+        return false;
+    }
+    const int64_t lockDeny =
+        zephyrJsonInt(zephyrUserRule(), maxFailedAttempt, zephyrDefaultLockDeny);
+    if ((lockDeny <= 0) || (failAttempts < lockDeny))
+    {
+        return false;
+    }
+    const int64_t unlockTime = zephyrJsonInt(zephyrUserRule(), unlockTimeout,
+                                             zephyrDefaultUnlockTime);
+    const int64_t lockTime = zephyrGetLockTime(userName);
+    return (lockTime + unlockTime) > static_cast<int64_t>(std::time(nullptr));
+}
+
+bool UserMgr::userLockedForFailedAttempt(const std::string& userName,
+                                         const bool& value)
+{
+    if (value == true)
+    {
+        return userLockedForFailedAttempt(userName);
+    }
+    // Reset the local failure counter instead of running pam_tally2.
+    if (!zephyrSetFailCount(userName, 0))
+    {
+        lg2::error("Unable to reset login failure counter");
+        elog<InternalFailure>();
+    }
+    return userLockedForFailedAttempt(userName);
+}
+#else
 bool UserMgr::userLockedForFailedAttempt(const std::string& userName)
 {
     // All user management lock has to be based on /etc/shadow
@@ -890,7 +1619,30 @@ bool UserMgr::userLockedForFailedAttempt(const std::string& userName,
 
     return userLockedForFailedAttempt(userName);
 }
+#endif
 
+#ifdef __ZEPHYR__
+bool UserMgr::userPasswordExpired(const std::string& userName)
+{
+    // Zephyr: password expiry comes from the local store (pwdUpdateTime /
+    // expireTime) instead of /etc/shadow (struct spwd / getspnam_r).
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return false;
+    }
+    const int64_t expireTime =
+        zephyrJsonInt(*user, zephyrJson::expireTime, zephyrNeverExpireDays);
+    if (expireTime >= zephyrNeverExpireDays)
+    {
+        return false;
+    }
+    const int64_t pwdUpdateTime =
+        zephyrJsonInt(*user, zephyrJson::pwdUpdateTime, 0);
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    return ((now - pwdUpdateTime) / zephyrSecondsPerDay) > expireTime;
+}
+#else
 bool UserMgr::userPasswordExpired(const std::string& userName)
 {
     // All user management lock has to be based on /etc/shadow
@@ -935,7 +1687,39 @@ bool UserMgr::userPasswordExpired(const std::string& userName)
 
     return false;
 }
+#endif
 
+#ifdef __ZEPHYR__
+UserSSHLists UserMgr::getUserAndSshGrpList()
+{
+    // Zephyr: the user list comes from the local store instead of /etc/passwd
+    // (fgetpwent_r/endpwent); the ssh list is the "ssh" group membership.
+    std::vector<std::string> userList;
+    std::vector<std::string> sshUsersList;
+    for (const auto& user : zephyrStore[zephyrJson::userList])
+    {
+        if (!user.is_object())
+        {
+            continue;
+        }
+        const std::string userName =
+            zephyrJsonString(user, zephyrJson::userName);
+        if (userName.empty())
+        {
+            continue;
+        }
+        userList.emplace_back(userName);
+        const auto groupNames =
+            zephyrStringList(user.value(zephyrJson::userGroupList, json()));
+        if (std::find(groupNames.begin(), groupNames.end(), grpSsh) !=
+            groupNames.end())
+        {
+            sshUsersList.emplace_back(userName);
+        }
+    }
+    return std::make_pair(std::move(userList), std::move(sshUsersList));
+}
+#else
 UserSSHLists UserMgr::getUserAndSshGrpList()
 {
     // All user management lock has to be based on /etc/shadow
@@ -987,6 +1771,7 @@ UserSSHLists UserMgr::getUserAndSshGrpList()
     endpwent();
     return std::make_pair(std::move(userList), std::move(sshUsersList));
 }
+#endif
 
 size_t UserMgr::getIpmiUsersCount()
 {
@@ -1000,6 +1785,14 @@ size_t UserMgr::getNonIpmiUsersCount()
     return usersList.size() - ipmiUsers.size();
 }
 
+#ifdef __ZEPHYR__
+bool UserMgr::isUserEnabled(const std::string& userName)
+{
+    // Zephyr: enabled state comes from the local store instead of /etc/shadow
+    // (struct spwd / getspnam_r).
+    return zephyrGetUserBool(userName, zephyrJson::enable, false);
+}
+#else
 bool UserMgr::isUserEnabled(const std::string& userName)
 {
     // All user management lock has to be based on /etc/shadow
@@ -1019,7 +1812,54 @@ bool UserMgr::isUserEnabled(const std::string& userName)
     }
     return false; // assume user is disabled for any error.
 }
+#endif
 
+#ifdef __ZEPHYR__
+std::vector<std::string> UserMgr::getUsersInGroup(const std::string& groupName)
+{
+    // Zephyr: /etc/group does not exist (the Zephyr getgrnam_r() stub returns
+    // ENOSYS).  Group existence comes from the local store (predefinedGroups +
+    // createdGroups, plus the privilege names); membership comes from each
+    // user's groupList and from the privilege field (Linux encodes privileges
+    // as group membership).
+    std::vector<std::string> usersInGroup;
+    const std::vector<std::string> knownGroups = zephyrCollectGroups();
+    const bool groupExists =
+        (std::find(privMgr.begin(), privMgr.end(), groupName) !=
+         privMgr.end()) ||
+        (std::find(knownGroups.begin(), knownGroups.end(), groupName) !=
+         knownGroups.end());
+
+    for (const auto& user : zephyrStore[zephyrJson::userList])
+    {
+        if (!user.is_object())
+        {
+            continue;
+        }
+        const std::string userName =
+            zephyrJsonString(user, zephyrJson::userName);
+        if (userName.empty())
+        {
+            continue;
+        }
+        const auto groupNames =
+            zephyrStringList(user.value(zephyrJson::userGroupList, json()));
+        if ((std::find(groupNames.begin(), groupNames.end(), groupName) !=
+             groupNames.end()) ||
+            (zephyrJsonString(user, zephyrJson::priv) == groupName))
+        {
+            usersInGroup.emplace_back(userName);
+        }
+    }
+
+    if (!groupExists && usersInGroup.empty())
+    {
+        lg2::error("Group '{GROUPNAME}' not found", "GROUPNAME", groupName);
+        // Don't throw error, just return empty userList - fallback
+    }
+    return usersInGroup;
+}
+#else
 std::vector<std::string> UserMgr::getUsersInGroup(const std::string& groupName)
 {
     std::vector<std::string> usersInGroup;
@@ -1045,6 +1885,7 @@ std::vector<std::string> UserMgr::getUsersInGroup(const std::string& groupName)
     }
     return usersInGroup;
 }
+#endif
 
 DbusUserObj UserMgr::getPrivilegeMapperObject(void)
 {
@@ -1196,6 +2037,27 @@ bool UserMgr::isGroupMember(const std::string& userName, gid_t primaryGid,
     return false;
 }
 
+#ifdef __ZEPHYR__
+void UserMgr::executeGroupCreation(const char* groupName)
+{
+    // Zephyr: /usr/sbin/groupadd is replaced by the local group list in
+    // users.json ("createdGroups").
+    if (!zephyrAddGroup(groupName))
+    {
+        elog<InternalFailure>();
+    }
+}
+
+void UserMgr::executeGroupDeletion(const char* groupName)
+{
+    // Zephyr: /usr/sbin/groupdel is replaced by the local group list in
+    // users.json; memberships are dropped as well.
+    if (!zephyrRemoveGroup(groupName))
+    {
+        elog<InternalFailure>();
+    }
+}
+#else
 void UserMgr::executeGroupCreation(const char* groupName)
 {
     executeCmd("/usr/sbin/groupadd", groupName);
@@ -1205,6 +2067,7 @@ void UserMgr::executeGroupDeletion(const char* groupName)
 {
     executeCmd("/usr/sbin/groupdel", groupName);
 }
+#endif
 
 UserInfoMap UserMgr::getUserInfo(std::string userName)
 {
@@ -1224,6 +2087,14 @@ UserInfoMap UserMgr::getUserInfo(std::string userName)
     }
     else
     {
+#ifdef __ZEPHYR__
+        // TODO(zephyr-unhandled): LDAP/remote users need the ObjectMapper
+        // privilege mapping plus getPrimaryGroup()/isGroupMember(), which read
+        // /etc/passwd and /etc/group.  The local Zephyr account store does not
+        // model remote users yet, so return an empty result (no RemoteUser
+        // property) instead of the Linux LDAP lookup.
+        return userInfo;
+#else
         auto primaryGid = getPrimaryGroup(userName);
 
         DbusUserObj objects = getPrivilegeMapperObject();
@@ -1309,11 +2180,29 @@ UserInfoMap UserMgr::getUserInfo(std::string userName)
             elog<InternalFailure>();
         }
         userInfo.emplace("RemoteUser", true);
+#endif
     }
 
     return userInfo;
 }
 
+#ifdef __ZEPHYR__
+void UserMgr::initializeAccountPolicy()
+{
+    // Zephyr: PAM is replaced by the account policy fields in users.json.
+    json& rule = zephyrUserRule();
+    AccountPolicyIface::minPasswordLength(
+        zephyrJsonInt(rule, minPasswdLenProp,
+                      zephyrDefaultMinPasswordLength));
+    AccountPolicyIface::rememberOldPasswordTimes(
+        zephyrJsonInt(rule, remOldPasswdCount,
+                      zephyrDefaultRememberOldPasswordTimes));
+    AccountPolicyIface::maxLoginAttemptBeforeLockout(
+        zephyrJsonInt(rule, maxFailedAttempt, zephyrDefaultLockDeny));
+    AccountPolicyIface::accountUnlockTimeout(
+        zephyrJsonInt(rule, unlockTimeout, zephyrDefaultUnlockTime));
+}
+#else
 void UserMgr::initializeAccountPolicy()
 {
     std::string valueStr;
@@ -1418,6 +2307,7 @@ void UserMgr::initializeAccountPolicy()
         AccountPolicyIface::accountUnlockTimeout(value32);
     }
 }
+#endif
 
 void UserMgr::initUserObjects(void)
 {
@@ -1490,6 +2380,10 @@ UserMgr::UserMgr(sdbusplus::bus_t& bus, const char* path) :
     pamPasswdConfigFile(defaultPamPasswdConfigFile),
     pamAuthConfigFile(defaultPamAuthConfigFile)
 {
+#ifdef __ZEPHYR__
+    // Load the local account store before any user object is created.
+    zephyrLoadStore();
+#endif
     UserMgrIface::allPrivileges(privMgr);
     groupsMgr = readAllGroupsOnSystem();
     std::sort(groupsMgr.begin(), groupsMgr.end());
@@ -1501,6 +2395,139 @@ UserMgr::UserMgr(sdbusplus::bus_t& bus, const char* path) :
     this->emit_object_added();
 }
 
+#ifdef __ZEPHYR__
+namespace
+{
+std::vector<std::string> zephyrSplitGroups(const char* groups)
+{
+    std::vector<std::string> groupNames;
+    if (groups == nullptr)
+    {
+        return groupNames;
+    }
+    std::string csv(groups);
+    std::stringstream stream(csv);
+    std::string item;
+    while (std::getline(stream, item, ','))
+    {
+        if (!item.empty())
+        {
+            groupNames.emplace_back(item);
+        }
+    }
+    return groupNames;
+}
+
+struct ZephyrUserGroups
+{
+    std::vector<std::string> groupNames;
+    std::string priv;
+};
+
+// Convert the Linux CSV convention used by useradd/usermod into the local
+// store model:
+//   - the caller appends the privilege as a pseudo group ("treat privilege as
+//     a group"), so tokens listed in privList become the local "priv" field;
+//   - the caller removes "ssh" from the CSV (Linux encodes ssh membership
+//     through the login shell), so sshRequested re-adds the local "ssh" group.
+ZephyrUserGroups zephyrParseUserGroups(const char* csv, bool sshRequested,
+                                       const std::vector<std::string>& privList)
+{
+    ZephyrUserGroups result;
+    for (const auto& token : zephyrSplitGroups(csv))
+    {
+        if (std::find(privList.begin(), privList.end(), token) != privList.end())
+        {
+            result.priv = token;
+        }
+        else
+        {
+            result.groupNames.emplace_back(token);
+        }
+    }
+    if (sshRequested)
+    {
+        result.groupNames.emplace_back(grpSsh);
+    }
+    std::sort(result.groupNames.begin(), result.groupNames.end());
+    result.groupNames.erase(
+        std::unique(result.groupNames.begin(), result.groupNames.end()),
+        result.groupNames.end());
+    return result;
+}
+} // namespace
+
+void UserMgr::executeUserAdd(const char* userName, const char* groups,
+                             bool sshRequested, bool enabled)
+{
+    // Zephyr: /usr/sbin/useradd is replaced by the local users.json store.
+    // The CSV convention (privilege appended as a group, ssh removed) is
+    // converted back to the local model; createUser() writes the store
+    // directly, this path is kept for other/future callers.
+    const ZephyrUserGroups parsed =
+        zephyrParseUserGroups(groups, sshRequested, privMgr);
+    if (!zephyrAddUser(userName, parsed.groupNames, parsed.priv, enabled))
+    {
+        // Low-level failure is logged by the store; the caller logs the
+        // operation-level error, like Linux executeCmd()/caller.
+        elog<InternalFailure>();
+    }
+}
+
+void UserMgr::executeUserDelete(const char* userName)
+{
+    // Zephyr: /usr/sbin/userdel is replaced by the local users.json store.
+    if (!zephyrRemoveUser(userName))
+    {
+        elog<InternalFailure>();
+    }
+}
+
+void UserMgr::executeUserRename(const char* userName, const char* newUserName)
+{
+    // Zephyr: /usr/sbin/usermod is replaced by the local users.json store.
+    if (!zephyrRenameUser(userName, newUserName))
+    {
+        elog<InternalFailure>();
+    }
+}
+
+void UserMgr::executeUserModify(const char* userName, const char* newGroups,
+                                bool sshRequested)
+{
+    // Zephyr: /usr/sbin/usermod is replaced by the local users.json store.
+    // The CSV convention (privilege appended as a group, ssh removed) is
+    // converted back to the local model; updateGroupsAndPriv() writes the
+    // store directly, this path is kept for other/future callers.
+    const ZephyrUserGroups parsed =
+        zephyrParseUserGroups(newGroups, sshRequested, privMgr);
+    if (!zephyrSetUserGroups(userName, parsed.groupNames) ||
+        !zephyrSetUserPrivilege(userName, parsed.priv))
+    {
+        elog<InternalFailure>();
+    }
+}
+
+void UserMgr::executeUserModifyUserEnable(const char* userName, bool enabled)
+{
+    // Zephyr: /usr/sbin/usermod is replaced by the local users.json store.
+    if (!zephyrSetUserEnabled(userName, enabled))
+    {
+        elog<InternalFailure>();
+    }
+}
+
+std::vector<std::string> UserMgr::getFailedAttempt(const char* userName)
+{
+    // Zephyr: pam_tally2 output is replaced by the local failTimes counter.
+    // The two callers (userLockedForFailedAttempt) read the store directly,
+    // so no pam_tally2 formatted output is produced here.
+    // TODO(zephyr-unhandled): keep this in sync if another caller starts
+    // consuming the pam_tally2 output format.
+    (void)userName;
+    return {};
+}
+#else
 void UserMgr::executeUserAdd(const char* userName, const char* groups,
                              bool sshRequested, bool enabled)
 {
@@ -1543,6 +2570,7 @@ std::vector<std::string> UserMgr::getFailedAttempt(const char* userName)
 {
     return executeCmd("/usr/sbin/pam_tally2", "-u", userName);
 }
+#endif
 
 } // namespace user
 } // namespace phosphor
