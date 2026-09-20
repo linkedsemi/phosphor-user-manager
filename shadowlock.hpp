@@ -25,6 +25,7 @@ using namespace phosphor::logging;
 /** @class Lock
  *  @brief Responsible for locking and unlocking /etc/shadow
  */
+#ifndef __ZEPHYR__
 class Lock
 {
   public:
@@ -51,6 +52,7 @@ class Lock
         }
     }
 };
+#endif
 
 } // namespace shadow
 } // namespace user
