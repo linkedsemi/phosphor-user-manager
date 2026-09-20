@@ -17,11 +17,24 @@ if(CONFIG_PHOSPHOR_USER_MANAGER)
 
     add_definitions(-DENABLE_ROOT_USER_MGMT) #root_user_mgmt enable
 
-    # #install /lfs/etc/users.json
-    # include(${ZEPHYR_CURRENT_MODULE_DIR}/../mk-rofs/zephyr/utils.cmake)
-    # file(GLOB FILES ${ZEPHYR_CURRENT_MODULE_DIR}/config/*.json)
-    # # configure/后跟目标配置文件在文件系统中的绝对路径, 即usr/share/crashdump/input为配置文件在zephyr文件系统中的路径
-    # set(dest_file ${CMAKE_BINARY_DIR}/configure_file/etc/)
-    # # install_config_file的具体使用方法请参考mk-rofs中utils.cmake
-    # install_config_file(${FILES} DESTINATION ${dest_file})
+    # Install the packaged user store as /etc/users.json in the rofs image.
+    # At runtime the overlay fs exposes it as
+    # CONFIG_FS_ROOT_OVERLAY "/etc/users.json" and copies it up to the rw layer
+    # on the first write.
+    if(EXISTS "${ZEPHYR_MK_ROFS_MODULE_DIR}")
+        include(${ZEPHYR_MK_ROFS_MODULE_DIR}/zephyr/utils.cmake)
+        set(FILES ${ZEPHYR_CURRENT_MODULE_DIR}/config/users.json)
+        # Staged under <build>/configure_file/..., which is the absolute path of
+        # the file inside the Zephyr filesystem (rofs staging directory).
+        set(dest_file ${CMAKE_BINARY_DIR}/configure_file/etc/)
+        # See mk-rofs/zephyr/utils.cmake for install_config_file usage.
+        install_config_file(${FILES} DESTINATION ${dest_file})
+
+        # Let CMake watch the source file so changing it re-runs the configure
+        # step (otherwise ninja reports "no work to do").
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FILES})
+    else()
+        message(FATAL_ERROR
+                "Required mk-rofs module missing at ${ZEPHYR_MK_ROFS_MODULE_DIR}, build abort!")
+    endif()
 endif()

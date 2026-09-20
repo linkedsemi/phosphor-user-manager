@@ -1,0 +1,33 @@
+{
+    "userList": [
+        {
+            "userId": 0,
+            "userName": "root",
+            "passWordHASH": "5d953a0f660e3c5db5223eebeaa47a10432c2f8bf4829278d0bfa1effefe4d02",
+            "passWordAES": "XslavPFlgyahor5d2ULNuQ==",
+            "priv": "priv-admin",
+            "groupList": [
+                "web",
+                "redfish",
+                "ipmi",
+                "ssh"
+            ],
+            "expireTime": 99999,
+            "enable": true,
+            "pwdUpdateTime": 1789862400,
+            "lockStatus": false,
+            "failTimes": 0,
+            "lockTime": 0
+        }
+    ],
+    "userRule": {
+        "gExpireTime": 99999,
+        "minlen": 8,
+        "remember": 0,
+        "deny": 3,
+        "unlock_time": 900,
+        "autoLock": true,
+        "newUserId": 1000
+    },
+    "createdGroups": []
+}
