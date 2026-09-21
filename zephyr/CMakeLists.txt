@@ -17,6 +17,12 @@ if(CONFIG_PHOSPHOR_USER_MANAGER)
 
     add_definitions(-DENABLE_ROOT_USER_MGMT) #root_user_mgmt enable
 
+    if(CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST)
+        zephyr_library_sources(
+            ${ZEPHYR_CURRENT_MODULE_DIR}/zephyr/user_manager_selftest.cpp
+        )
+    endif()
+
     # Install the packaged user store as /etc/users.json in the rofs image.
     # At runtime the overlay fs exposes it as
     # CONFIG_FS_ROOT_OVERLAY "/etc/users.json" and copies it up to the rw layer

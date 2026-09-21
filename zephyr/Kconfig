@@ -1,3 +1,22 @@
 
 config PHOSPHOR_USER_MANAGER
     bool "openbmc phosphor-user-manager"
+
+config PHOSPHOR_USER_MANAGER_SELFTEST
+    bool "run the phosphor-user-manager D-Bus self test at boot"
+    depends on PHOSPHOR_USER_MANAGER
+    help
+      Start a thread that waits for the D-Bus broker and the User.Manager
+      service, then exercises the full D-Bus API (CreateUser/GetUserInfo/
+      RenameUser/DeleteGroup/AccountPolicy/...) the way other services do
+      and prints PASS/FAIL per case.
+
+config PHOSPHOR_USER_MANAGER_SELFTEST_DISCONNECT_BUG
+    bool "reproduce the dbus-broker disconnect bug in the self test"
+    depends on PHOSPHOR_USER_MANAGER_SELFTEST
+    help
+      After the self test, call disconnect_from_dbroker() like the earlier
+      code did.  That returns the socketpair to the broker pool and corrupts
+      the broker: the next client connection (ipmi_thread) makes the broker
+      thread fault and then the other D-Bus threads die with it.  Enable this
+      to reproduce the bug for the fix; leave it off for a usable test image.

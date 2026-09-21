@@ -1,0 +1,631 @@
+/*
+ * Copyright (c) 2026
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Zephyr D-Bus self test for phosphor-user-manager.
+ *
+ * Build the app with -DCONFIG_PHOSPHOR_USER_MANAGER_SELFTEST=y.  The test
+ * thread waits for the D-Bus broker and for the User.Manager name to appear,
+ * then calls the full D-Bus API exactly like another service (bmcweb, ipmid,
+ * ...) would, printing PASS/FAIL per case and a final summary.
+ */
+
+#include "dbus_broker.h"
+
+#include <sdbusplus/bus.hpp>
+#include <sdbusplus/message.hpp>
+
+#include <nlohmann/json.hpp>
+
+#include <pthread.h>
+
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+
+#include <algorithm>
+#include <fstream>
+#include <map>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace
+{
+
+constexpr const char* userManagerService = "xyz.openbmc_project.User.Manager";
+constexpr const char* dbusService = "org.freedesktop.DBus";
+constexpr const char* dbusPath = "/org/freedesktop/DBus";
+constexpr const char* dbusIface = "org.freedesktop.DBus";
+constexpr const char* propertiesIface = "org.freedesktop.DBus.Properties";
+constexpr const char* userRoot = "/xyz/openbmc_project/user";
+constexpr const char* managerIface = "xyz.openbmc_project.User.Manager";
+constexpr const char* policyIface = "xyz.openbmc_project.User.AccountPolicy";
+constexpr const char* attributesIface = "xyz.openbmc_project.User.Attributes";
+constexpr const char* deleteIface = "xyz.openbmc_project.Object.Delete";
+constexpr const char* usersFile = CONFIG_FS_ROOT_OVERLAY "/etc/users.json";
+
+constexpr const char* testUser = "ut_user1";
+constexpr const char* renamedUser = "ut_user2";
+constexpr const char* testGroup = "openbmc_rfr_ut";
+
+using Bus = sdbusplus::bus::bus;
+using UserInfo = std::map<
+    std::string, std::variant<std::string, std::vector<std::string>, bool>>;
+using PropValue = std::variant<std::string, std::vector<std::string>, bool,
+                               uint8_t, uint16_t, uint32_t>;
+
+int passed = 0;
+int failed = 0;
+
+void check(bool ok, const char* what)
+{
+    printk("[usermgr-test] %-56s %s\n", what, ok ? "PASS" : "FAIL");
+    if (ok)
+    {
+        ++passed;
+    }
+    else
+    {
+        ++failed;
+    }
+}
+
+std::string userPath(const std::string& user)
+{
+    return std::string(userRoot) + "/" + user;
+}
+
+bool contains(const std::vector<std::string>& list, const char* item)
+{
+    return std::find(list.begin(), list.end(), std::string(item)) !=
+           list.end();
+}
+
+const std::string* infoString(const UserInfo& info, const char* key)
+{
+    const auto it = info.find(key);
+    return (it == info.end()) ? nullptr : std::get_if<std::string>(&it->second);
+}
+
+const std::vector<std::string>* infoList(const UserInfo& info, const char* key)
+{
+    const auto it = info.find(key);
+    return (it == info.end()) ? nullptr
+                             : std::get_if<std::vector<std::string>>(
+                                   &it->second);
+}
+
+const bool* infoBool(const UserInfo& info, const char* key)
+{
+    const auto it = info.find(key);
+    return (it == info.end()) ? nullptr : std::get_if<bool>(&it->second);
+}
+
+template <typename... Args>
+bool callManager(Bus& bus, const char* iface, const char* method,
+                 const std::string& path, std::string& err,
+                 const Args&... args)
+{
+    try
+    {
+        auto msg =
+            bus.new_method_call(userManagerService, path.c_str(), iface,
+                                method);
+        if constexpr (sizeof...(Args) > 0)
+        {
+            msg.append(args...);
+        }
+        bus.call(msg);
+        return true;
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        err = e.name();
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        err = e.what();
+        return false;
+    }
+}
+
+bool getUserInfo(Bus& bus, const std::string& user, UserInfo& info,
+                 std::string& err)
+{
+    try
+    {
+        auto msg = bus.new_method_call(userManagerService, userRoot,
+                                      managerIface, "GetUserInfo");
+        msg.append(user);
+        auto reply = bus.call(msg);
+        reply.read(info);
+        return true;
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        err = e.name();
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        err = e.what();
+        return false;
+    }
+}
+
+template <typename T>
+bool getProperty(Bus& bus, const std::string& path, const char* iface,
+                 const char* prop, T& out, std::string& err)
+{
+    try
+    {
+        auto msg = bus.new_method_call(userManagerService, path.c_str(),
+                                      propertiesIface, "Get");
+        msg.append(std::string(iface), std::string(prop));
+        auto reply = bus.call(msg);
+        PropValue value;
+        reply.read(value);
+        if (const auto* typed = std::get_if<T>(&value))
+        {
+            out = *typed;
+            return true;
+        }
+        err = "unexpected property type";
+        return false;
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        err = e.name();
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        err = e.what();
+        return false;
+    }
+}
+
+template <typename T>
+bool setProperty(Bus& bus, const std::string& path, const char* iface,
+                 const char* prop, const T& value, std::string& err)
+{
+    try
+    {
+        auto msg = bus.new_method_call(userManagerService, path.c_str(),
+                                      propertiesIface, "Set");
+        PropValue wrapped{value};
+        msg.append(std::string(iface), std::string(prop), wrapped);
+        bus.call(msg);
+        return true;
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        err = e.name();
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        err = e.what();
+        return false;
+    }
+}
+
+void removeIfPresent(Bus& bus, const char* user)
+{
+    std::string ignored;
+    callManager(bus, deleteIface, "Delete", userPath(user), ignored);
+}
+
+void runManagerTests(Bus& bus)
+{
+    std::string err;
+
+    // Seeded root account.
+    {
+        UserInfo info;
+        const bool ok = getUserInfo(bus, "root", info, err);
+        const std::string* priv = ok ? infoString(info, "UserPrivilege") : nullptr;
+        const std::vector<std::string>* groups =
+            ok ? infoList(info, "UserGroups") : nullptr;
+        const bool* enabled = ok ? infoBool(info, "UserEnabled") : nullptr;
+        const bool* expired = ok ? infoBool(info, "UserPasswordExpired") : nullptr;
+        const bool* remote = ok ? infoBool(info, "RemoteUser") : nullptr;
+        check(ok && priv != nullptr && *priv == "priv-admin" && groups != nullptr &&
+                  contains(*groups, "web") && contains(*groups, "redfish") &&
+                  contains(*groups, "ipmi") && contains(*groups, "ssh") &&
+                  enabled != nullptr && *enabled && expired != nullptr &&
+                  !*expired && remote != nullptr && !*remote,
+              "GetUserInfo(root): priv-admin + groups + enabled");
+    }
+
+    // Manager properties.
+    {
+        std::vector<std::string> privs;
+        std::vector<std::string> groups;
+        check(getProperty(bus, userRoot, managerIface, "AllPrivileges", privs,
+                          err) &&
+                  contains(privs, "priv-admin") &&
+                  contains(privs, "priv-operator") &&
+                  contains(privs, "priv-user"),
+              "Manager.AllPrivileges");
+        check(getProperty(bus, userRoot, managerIface, "AllGroups", groups,
+                          err) &&
+                  contains(groups, "web") && contains(groups, "redfish") &&
+                  contains(groups, "ipmi") && contains(groups, "ssh"),
+              "Manager.AllGroups contains predefined groups");
+    }
+
+    removeIfPresent(bus, testUser);
+    removeIfPresent(bus, renamedUser);
+
+    // CreateUser + GetUserInfo.
+    check(callManager(bus, managerIface, "CreateUser", userRoot, err,
+                      std::string(testUser),
+                      std::vector<std::string>{"web", "redfish"},
+                      std::string("priv-user"), true),
+          "CreateUser ut_user1");
+    {
+        UserInfo info;
+        const bool ok = getUserInfo(bus, testUser, info, err);
+        const std::string* priv = ok ? infoString(info, "UserPrivilege") : nullptr;
+        const std::vector<std::string>* groups =
+            ok ? infoList(info, "UserGroups") : nullptr;
+        const bool* enabled = ok ? infoBool(info, "UserEnabled") : nullptr;
+        check(ok && priv != nullptr && *priv == "priv-user" && groups != nullptr &&
+                  contains(*groups, "web") && contains(*groups, "redfish") &&
+                  enabled != nullptr && *enabled,
+              "GetUserInfo(ut_user1) matches CreateUser");
+    }
+
+    // Negative: duplicate user.
+    {
+        std::string e;
+        const bool ok = callManager(bus, managerIface, "CreateUser", userRoot, e,
+                                    std::string(testUser),
+                                    std::vector<std::string>{"web"},
+                                    std::string("priv-user"), true);
+        check(!ok &&
+                  e == "xyz.openbmc_project.User.Common.Error.UserNameExists",
+              "CreateUser duplicate rejected (UserNameExists)");
+    }
+
+    // Negative: unknown group.
+    {
+        std::string e;
+        const bool ok = callManager(bus, managerIface, "CreateUser", userRoot, e,
+                                    std::string("ut_bad"),
+                                    std::vector<std::string>{"not_a_group"},
+                                    std::string("priv-user"), true);
+        check(!ok && e == "xyz.openbmc_project.Common.Error.InvalidArgument",
+              "CreateUser with invalid group rejected (InvalidArgument)");
+    }
+
+    // User.Attributes properties (UserEnabled / UserGroups / UserPrivilege).
+    check(setProperty(bus, userPath(testUser), attributesIface, "UserEnabled",
+                      false, err),
+          "set UserEnabled=false");
+    {
+        UserInfo info;
+        const bool ok = getUserInfo(bus, testUser, info, err);
+        const bool* enabled = ok ? infoBool(info, "UserEnabled") : nullptr;
+        check(ok && enabled != nullptr && !*enabled,
+              "GetUserInfo reflects UserEnabled=false");
+    }
+    check(setProperty(bus, userPath(testUser), attributesIface, "UserGroups",
+                      std::vector<std::string>{"ipmi", "redfish"}, err) &&
+              setProperty(bus, userPath(testUser), attributesIface,
+                          "UserPrivilege", std::string("priv-operator"), err),
+          "set UserGroups/UserPrivilege");
+    {
+        UserInfo info;
+        const bool ok = getUserInfo(bus, testUser, info, err);
+        const std::string* priv = ok ? infoString(info, "UserPrivilege") : nullptr;
+        const std::vector<std::string>* groups =
+            ok ? infoList(info, "UserGroups") : nullptr;
+        check(ok && priv != nullptr && *priv == "priv-operator" &&
+                  groups != nullptr && contains(*groups, "ipmi") &&
+                  contains(*groups, "redfish") && !contains(*groups, "web"),
+              "GetUserInfo reflects updated groups/privilege");
+    }
+
+    // Locked state query + failure counter reset.
+    check(setProperty(bus, userPath(testUser), attributesIface,
+                      "UserLockedForFailedAttempt", true, err) &&
+              setProperty(bus, userPath(testUser), attributesIface,
+                          "UserLockedForFailedAttempt", false, err),
+          "set/reset UserLockedForFailedAttempt");
+    {
+        bool locked = true;
+        check(getProperty(bus, userPath(testUser), attributesIface,
+                          "UserLockedForFailedAttempt", locked, err) &&
+                  !locked,
+              "UserLockedForFailedAttempt stays false after reset");
+    }
+
+    // AccountPolicy defaults, update, restore and negative case.
+    {
+        uint8_t minlen = 0;
+        uint8_t remember = 0;
+        uint16_t deny = 0;
+        uint32_t unlockTime = 0;
+        check(getProperty(bus, userRoot, policyIface, "MinPasswordLength",
+                          minlen, err) &&
+                  getProperty(bus, userRoot, policyIface,
+                              "RememberOldPasswordTimes", remember, err) &&
+                  getProperty(bus, userRoot, policyIface,
+                              "MaxLoginAttemptBeforeLockout", deny, err) &&
+                  getProperty(bus, userRoot, policyIface,
+                              "AccountUnlockTimeout", unlockTime, err) &&
+                  minlen == 8 && remember == 0 && deny == 3 && unlockTime == 900,
+              "AccountPolicy defaults (8/0/3/900)");
+    }
+    check(setProperty(bus, userRoot, policyIface, "MinPasswordLength",
+                      static_cast<uint8_t>(12), err) &&
+              setProperty(bus, userRoot, policyIface,
+                          "RememberOldPasswordTimes", static_cast<uint8_t>(2),
+                          err) &&
+              setProperty(bus, userRoot, policyIface,
+                          "MaxLoginAttemptBeforeLockout",
+                          static_cast<uint16_t>(5), err) &&
+              setProperty(bus, userRoot, policyIface, "AccountUnlockTimeout",
+                          static_cast<uint32_t>(1800), err),
+          "set AccountPolicy (12/2/5/1800)");
+    {
+        uint8_t minlen = 0;
+        uint8_t remember = 0;
+        uint16_t deny = 0;
+        uint32_t unlockTime = 0;
+        check(getProperty(bus, userRoot, policyIface, "MinPasswordLength",
+                          minlen, err) &&
+                  getProperty(bus, userRoot, policyIface,
+                              "RememberOldPasswordTimes", remember, err) &&
+                  getProperty(bus, userRoot, policyIface,
+                              "MaxLoginAttemptBeforeLockout", deny, err) &&
+                  getProperty(bus, userRoot, policyIface,
+                              "AccountUnlockTimeout", unlockTime, err) &&
+                  minlen == 12 && remember == 2 && deny == 5 &&
+                  unlockTime == 1800,
+              "AccountPolicy read back updated values");
+    }
+    {
+        std::string e;
+        const bool ok = setProperty(bus, userRoot, policyIface,
+                                    "MinPasswordLength",
+                                    static_cast<uint8_t>(4), e);
+        check(!ok && e == "xyz.openbmc_project.Common.Error.InvalidArgument",
+              "MinPasswordLength<8 rejected (InvalidArgument)");
+    }
+    setProperty(bus, userRoot, policyIface, "MinPasswordLength",
+                static_cast<uint8_t>(8), err);
+    setProperty(bus, userRoot, policyIface, "RememberOldPasswordTimes",
+                static_cast<uint8_t>(0), err);
+    setProperty(bus, userRoot, policyIface, "MaxLoginAttemptBeforeLockout",
+                static_cast<uint16_t>(3), err);
+    setProperty(bus, userRoot, policyIface, "AccountUnlockTimeout",
+                static_cast<uint32_t>(900), err);
+
+    // CreateGroup / DeleteGroup + AllGroups.
+    {
+        std::string e;
+        const bool created =
+            callManager(bus, managerIface, "CreateGroup", userRoot, e,
+                        std::string(testGroup));
+        std::vector<std::string> groups;
+        check(created &&
+                  getProperty(bus, userRoot, managerIface, "AllGroups", groups,
+                              e) &&
+                  contains(groups, testGroup),
+              "CreateGroup appears in AllGroups");
+        const bool deleted =
+            callManager(bus, managerIface, "DeleteGroup", userRoot, e,
+                        std::string(testGroup));
+        groups.clear();
+        check(deleted &&
+                  getProperty(bus, userRoot, managerIface, "AllGroups", groups,
+                              e) &&
+                  !contains(groups, testGroup),
+              "DeleteGroup removed from AllGroups");
+        std::string e2;
+        const bool again = callManager(bus, managerIface, "DeleteGroup",
+                                       userRoot, e2, std::string(testGroup));
+        check(!again &&
+                  e2 ==
+                      "xyz.openbmc_project.User.Common.Error.GroupNameDoesNotExist",
+              "DeleteGroup unknown group rejected");
+    }
+
+    // RenameUser + Object.Delete.
+    check(callManager(bus, managerIface, "RenameUser", userRoot, err,
+                      std::string(testUser), std::string(renamedUser)),
+          "RenameUser ut_user1 -> ut_user2");
+    {
+        UserInfo info;
+        const bool ok = getUserInfo(bus, renamedUser, info, err);
+        const std::string* priv = ok ? infoString(info, "UserPrivilege") : nullptr;
+        check(ok && priv != nullptr && *priv == "priv-operator",
+              "renamed user keeps its properties");
+    }
+    check(callManager(bus, deleteIface, "Delete", userPath(renamedUser), err),
+          "Object.Delete removes the user");
+    {
+        UserInfo info;
+        std::string e;
+        const bool ok = getUserInfo(bus, renamedUser, info, e);
+        check(ok && info.empty(), "deleted user returns empty info");
+    }
+}
+
+void runStoreTests()
+{
+    std::ifstream in(usersFile);
+    nlohmann::json store;
+    bool parsed = false;
+    if (in.is_open())
+    {
+        try
+        {
+            store = nlohmann::json::parse(std::string(
+                std::istreambuf_iterator<char>(in),
+                std::istreambuf_iterator<char>()));
+            parsed = store.is_object();
+        }
+        catch (const std::exception&)
+        {
+            parsed = false;
+        }
+    }
+    check(parsed, "users.json readable and valid");
+    if (!parsed)
+    {
+        return;
+    }
+
+    const auto& users = store.value("userList", nlohmann::json::array());
+    bool rootOk = false;
+    for (const auto& user : users)
+    {
+        if (user.value("userName", std::string{}) == "root")
+        {
+            rootOk = user.value("priv", std::string{}) == "priv-admin";
+        }
+    }
+    check(rootOk, "users.json keeps the seeded root account");
+
+    const auto& rule = store.value("userRule", nlohmann::json::object());
+    check(rule.contains("minlen") && rule.contains("remember") &&
+              rule.contains("deny") && rule.contains("unlock_time"),
+          "users.json userRule uses Linux PAM key names");
+
+    check(store.contains("createdGroups") && store["createdGroups"].is_array(),
+          "users.json has createdGroups array");
+
+    bool leftovers = false;
+    for (const auto& user : users)
+    {
+        const std::string name = user.value("userName", std::string{});
+        if (name == testUser || name == renamedUser)
+        {
+            leftovers = true;
+        }
+    }
+    check(!leftovers, "test users are not persisted after delete");
+}
+
+void runTests(Bus& bus)
+{
+    runManagerTests(bus);
+    runStoreTests();
+}
+
+void* selftestThread(void*)
+{
+    sd_bus* rawBus = nullptr;
+    for (int i = 0; i < 100 && connect_to_dbroker(&rawBus) != 0; ++i)
+    {
+        k_msleep(100);
+    }
+    if (rawBus == nullptr)
+    {
+        printk("[usermgr-test] no D-Bus broker connection\n");
+        return nullptr;
+    }
+
+    Bus bus(rawBus, std::false_type());
+
+    bool serviceUp = false;
+    for (int i = 0; i < 100 && !serviceUp; ++i)
+    {
+        try
+        {
+            auto msg = bus.new_method_call(dbusService, dbusPath, dbusIface,
+                                          "GetNameOwner");
+            msg.append(std::string(userManagerService));
+            bus.call(msg);
+            serviceUp = true;
+        }
+        catch (const sdbusplus::exception_t&)
+        {
+            k_msleep(100);
+        }
+    }
+    if (!serviceUp)
+    {
+        printk("[usermgr-test] %s is not on the bus\n", userManagerService);
+        return nullptr;
+    }
+
+    // The service claims its bus name just before it enters process_loop(),
+    // so wait until it actually answers a request instead of assuming the
+    // loop is already running.
+    bool answering = false;
+    std::string probeErr;
+    for (int i = 0; i < 40 && !answering; ++i)
+    {
+        UserInfo probe;
+        answering = getUserInfo(bus, "root", probe, probeErr);
+        if (!answering)
+        {
+            k_msleep(250);
+        }
+    }
+    if (!answering)
+    {
+        printk("[usermgr-test] %s is not answering (%s)\n", userManagerService,
+               probeErr.c_str());
+    }
+
+    printk("[usermgr-test] user manager ready, running D-Bus self test\n");
+    runTests(bus);
+    printk("[usermgr-test] ==== %d passed, %d failed ====\n", passed, failed);
+
+#ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST_DISCONNECT_BUG
+    // Known bug reproduction, kept for whoever fixes the broker socketpair
+    // pool: disconnecting hands the socketpair back and the next client
+    // connection makes the broker thread fault.
+    printk("[usermgr-test] reproducing disconnect bug (broker may die)\n");
+    disconnect_from_dbroker(rawBus);
+#endif
+
+    // Keep the connection (and this thread) alive: returning the socketpair to
+    // the broker pool corrupted the broker when the next client connected, and
+    // a one-shot test image has nothing to gain from tearing the connection
+    // down.
+    while (true)
+    {
+        k_sleep(K_FOREVER);
+    }
+}
+
+// The test thread must be a pthread: the D-Bus client throws C++ exceptions
+// (SdBusError) and those cannot unwind in a plain K_THREAD_DEFINE thread on
+// this target, which ends in std::terminate.
+//
+// The stack array has K_KERNEL_STACK_LEN() elements (size + reserved trap
+// space); pthread_attr_setstack() must be given the array pointer plus the
+// logical size, exactly like the app does with its CREATE_TASK_WITH_PTHREAD
+// stacks.
+K_KERNEL_STACK_DEFINE(selftestStack, 32768);
+
+} // namespace
+
+int user_manager_selftest_start(void)
+{
+    // Called from user_manager_main() once the service owns its name.
+    pthread_attr_t attr;
+    int ret = pthread_attr_init(&attr);
+    if (ret != 0)
+    {
+        return ret;
+    }
+    ret = pthread_attr_setstack(&attr, selftestStack, 32768);
+    if (ret != 0)
+    {
+        return ret;
+    }
+    pthread_t thread;
+    return pthread_create(
+        &thread, &attr,
+        [](void*) -> void* { return selftestThread(nullptr); }, nullptr);
+}

@@ -53,6 +53,15 @@ int user_manager_main(int argc, char** argv)
 
     printk_thread("process_loop");
     k_sem_give(&user_manager_ready_sem);
+#ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
+    // Run the D-Bus self test in its own pthread (C++ exceptions cannot unwind
+    // in a plain K_THREAD_DEFINE thread on this target).
+    extern int user_manager_selftest_start(void);
+    if (user_manager_selftest_start() != 0)
+    {
+        printk_thread("user manager selftest start failed");
+    }
+#endif
     // Wait for client request
     bus.process_loop();
     
