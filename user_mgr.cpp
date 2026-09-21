@@ -21,6 +21,9 @@
 #include "file.hpp"
 #include "shadowlock.hpp"
 #include "users.hpp"
+#ifdef __ZEPHYR__
+#include "user_mgr_libc.h"
+#endif
 
 #include <grp.h>
 #include <pwd.h>
@@ -924,6 +927,97 @@ std::vector<std::string> zephyrCollectGroups()
         }
     }
     return groups;
+}
+
+// ---------------------------------------------------------------------------
+// Local (users.json) authentication used by other services through the C API
+// in user_mgr_libc.h.  Replaces the Linux PAM stack on Zephyr.
+// ---------------------------------------------------------------------------
+int zephyrLocalAuthenticate(const std::string& userName,
+                            const std::string& password,
+                            const std::string& loginSource)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return ZEPHYR_PAM_USER_UNKNOWN;
+    }
+    if (!zephyrJsonBool(*user, zephyrJson::enable, false))
+    {
+        lg2::warning("Local user '{USERNAME}' is disabled ({SOURCE})",
+                     "USERNAME", userName, "SOURCE", loginSource);
+        return ZEPHYR_PAM_USER_UNKNOWN;
+    }
+
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t deny =
+        zephyrJsonInt(zephyrUserRule(), maxFailedAttempt, zephyrDefaultLockDeny);
+    const int64_t unlockTime =
+        zephyrJsonInt(zephyrUserRule(), unlockTimeout, zephyrDefaultUnlockTime);
+    int64_t failTimes = zephyrJsonInt(*user, zephyrJson::failTimes, 0);
+    const int64_t lockTime = zephyrJsonInt(*user, zephyrJson::lockTime, 0);
+    if ((deny > 0) && (failTimes >= deny) && ((lockTime + unlockTime) > now))
+    {
+        lg2::warning("Local user '{USERNAME}' is locked out ({SOURCE})",
+                     "USERNAME", userName, "SOURCE", loginSource);
+        return ZEPHYR_PAM_MAXTRIES;
+    }
+
+    const int64_t expireTime =
+        zephyrJsonInt(*user, zephyrJson::expireTime, zephyrNeverExpireDays);
+    const int64_t pwdUpdateTime =
+        zephyrJsonInt(*user, zephyrJson::pwdUpdateTime, 0);
+    const bool passwordExpired =
+        (expireTime < zephyrNeverExpireDays) &&
+        (((now - pwdUpdateTime) / zephyrSecondsPerDay) > expireTime);
+
+    const std::string storedHash =
+        zephyrJsonString(*user, zephyrJson::passWordHash);
+    if (storedHash.empty() || (storedHash != zephyrSha256(password)))
+    {
+        ++failTimes;
+        (*user)[zephyrJson::failTimes] = failTimes;
+        (*user)[zephyrJson::lockTime] = static_cast<uint64_t>(now);
+        (*user)[zephyrJson::lockStatus] = (deny > 0) && (failTimes >= deny);
+        zephyrSaveStore();
+        lg2::warning("Authentication failed for '{USERNAME}' ({SOURCE}), "
+                     "failed attempts {COUNT}",
+                     "USERNAME", userName, "SOURCE", loginSource, "COUNT",
+                     failTimes);
+        return ZEPHYR_PAM_AUTHTOK_ERR;
+    }
+
+    // Successful login clears the lockout counters.
+    (*user)[zephyrJson::failTimes] = 0;
+    (*user)[zephyrJson::lockStatus] = false;
+    zephyrSaveStore();
+    return passwordExpired ? ZEPHYR_PAM_NEW_AUTHTOK_REQD : ZEPHYR_PAM_SUCCESS;
+}
+
+int zephyrLocalUpdatePassword(const std::string& userName,
+                              const std::string& newPassword)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return ZEPHYR_PAM_USER_UNKNOWN;
+    }
+
+    const int64_t minLen = zephyrJsonInt(zephyrUserRule(), minPasswdLenProp,
+                                         zephyrDefaultMinPasswordLength);
+    if (static_cast<int64_t>(newPassword.size()) < minLen)
+    {
+        lg2::error("New password for '{USERNAME}' is shorter than {MINLEN}",
+                   "USERNAME", userName, "MINLEN", minLen);
+        return ZEPHYR_PAM_AUTHTOK_ERR;
+    }
+
+    (*user)[zephyrJson::passWordHash] = zephyrSha256(newPassword);
+    (*user)[zephyrJson::passWordAes] = zephyrAesEncrypt(newPassword);
+    (*user)[zephyrJson::pwdUpdateTime] = static_cast<int64_t>(std::time(nullptr));
+    (*user)[zephyrJson::failTimes] = 0;
+    (*user)[zephyrJson::lockStatus] = false;
+    return zephyrSaveStore() ? ZEPHYR_PAM_SUCCESS : ZEPHYR_PAM_AUTHTOK_ERR;
 }
 } // namespace
 
@@ -2574,3 +2668,45 @@ std::vector<std::string> UserMgr::getFailedAttempt(const char* userName)
 
 } // namespace user
 } // namespace phosphor
+
+#ifdef __ZEPHYR__
+// C API used by other services (bmcweb's PAM shim, wolfSSH, ...).
+extern "C" int zephyrAuthenticate(const char* username, uint32_t usernameLen,
+                                  const char* password, uint32_t passwordLen,
+                                  const char* loginSource)
+{
+    return phosphor::user::zephyrLocalAuthenticate(
+        std::string((username != nullptr) ? username : "", usernameLen),
+        std::string((password != nullptr) ? password : "", passwordLen),
+        std::string((loginSource != nullptr) ? loginSource : "web"));
+}
+
+extern "C" int zephyrUpdatePassword(const char* username, uint32_t usernameLen,
+                                    const char* newPassword,
+                                    uint32_t newPasswordLen)
+{
+    return phosphor::user::zephyrLocalUpdatePassword(
+        std::string((username != nullptr) ? username : "", usernameLen),
+        std::string((newPassword != nullptr) ? newPassword : "",
+                    newPasswordLen));
+}
+
+#ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
+// Self test only, see user_mgr_libc.h.
+extern "C" int zephyrTestSetPasswordAge(const char* username,
+                                        uint32_t usernameLen,
+                                        int64_t pwdUpdateTime,
+                                        int64_t expireTime)
+{
+    nlohmann::json* user = phosphor::user::zephyrFindUser(
+        std::string((username != nullptr) ? username : "", usernameLen));
+    if (user == nullptr)
+    {
+        return -1;
+    }
+    (*user)[phosphor::user::zephyrJson::pwdUpdateTime] = pwdUpdateTime;
+    (*user)[phosphor::user::zephyrJson::expireTime] = expireTime;
+    return phosphor::user::zephyrSaveStore() ? 0 : -1;
+}
+#endif
+#endif /* __ZEPHYR__ */
