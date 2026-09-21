@@ -11,6 +11,12 @@ if(CONFIG_PHOSPHOR_USER_MANAGER)
     zephyr_export_include_directories(
         ${ZEPHYR_CURRENT_MODULE_DIR}
     )
+    # zephyr_export_include_directories() only reaches consumers of the
+    # library, so add the root as a plain include dir for our own sources too
+    # (e.g. zephyr/user_manager_selftest.cpp including user_mgr_libc.h).
+    zephyr_library_include_directories(
+        ${ZEPHYR_CURRENT_MODULE_DIR}
+    )
 
     zephyr_library_link_libraries(phosphor-dbus-interfaces)
     zephyr_library_link_libraries(phosphor-logging)

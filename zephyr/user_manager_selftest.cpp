@@ -12,6 +12,7 @@
  */
 
 #include "dbus_broker.h"
+#include "user_mgr_libc.h"
 
 #include <sdbusplus/bus.hpp>
 #include <sdbusplus/message.hpp>
@@ -24,6 +25,8 @@
 #include <zephyr/sys/printk.h>
 
 #include <algorithm>
+#include <cstring>
+#include <ctime>
 #include <fstream>
 #include <map>
 #include <string>
@@ -47,7 +50,17 @@ constexpr const char* usersFile = CONFIG_FS_ROOT_OVERLAY "/etc/users.json";
 
 constexpr const char* testUser = "ut_user1";
 constexpr const char* renamedUser = "ut_user2";
+constexpr const char* passwordUser = "ut_pass1";
 constexpr const char* testGroup = "openbmc_rfr_ut";
+
+// Factory password of a freshly created account and the sha256 the store has
+// to keep for it (see config/users.json).
+constexpr const char* defaultPassword = "0penBmc";
+constexpr const char* changedPassword = "NewPassw0rd!";
+constexpr const char* defaultPasswordHash =
+    "5d953a0f660e3c5db5223eebeaa47a10432c2f8bf4829278d0bfa1effefe4d02";
+constexpr const char* changedPasswordHash =
+    "4adae1fb4dba8c2e8188a269de964a107a40f94770b6a96ba6e1132d50be354d";
 
 using Bus = sdbusplus::bus::bus;
 using UserInfo = std::map<
@@ -505,7 +518,7 @@ void runStoreTests()
     for (const auto& user : users)
     {
         const std::string name = user.value("userName", std::string{});
-        if (name == testUser || name == renamedUser)
+        if (name == testUser || name == renamedUser || name == passwordUser)
         {
             leftovers = true;
         }
@@ -513,9 +526,162 @@ void runStoreTests()
     check(!leftovers, "test users are not persisted after delete");
 }
 
+// ---------------------------------------------------------------------------
+// Password tests: hash, verification, change and expiration, driven through
+// the same C API bmcweb's PAM shim uses.
+// ---------------------------------------------------------------------------
+bool readStore(nlohmann::json& store)
+{
+    std::ifstream in(usersFile);
+    if (!in.is_open())
+    {
+        return false;
+    }
+    try
+    {
+        store = nlohmann::json::parse(std::string(
+            std::istreambuf_iterator<char>(in),
+            std::istreambuf_iterator<char>()));
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+    return store.is_object();
+}
+
+const nlohmann::json* findStoreUser(const nlohmann::json& store,
+                                    const char* name)
+{
+    // NOTE: json::value() returns a copy, so the entry has to be looked up
+    // through find() to keep the returned pointer valid for the caller.
+    const auto users = store.find("userList");
+    if ((users == store.end()) || !users->is_array())
+    {
+        return nullptr;
+    }
+    for (const auto& user : *users)
+    {
+        if (user.is_object() && user.value("userName", std::string{}) == name)
+        {
+            return &user;
+        }
+    }
+    return nullptr;
+}
+
+std::string storeHash(const nlohmann::json& store, const char* name)
+{
+    const nlohmann::json* user = findStoreUser(store, name);
+    return (user == nullptr) ? std::string{}
+                             : user->value("passWordHASH", std::string{});
+}
+
+int storeFailTimes(const nlohmann::json& store, const char* name)
+{
+    const nlohmann::json* user = findStoreUser(store, name);
+    return (user == nullptr) ? -1 : user->value("failTimes", -1);
+}
+
+int authenticate(const char* user, const char* password)
+{
+    return zephyrAuthenticate(user, static_cast<uint32_t>(strlen(user)),
+                              password,
+                              static_cast<uint32_t>(strlen(password)),
+                              "selftest");
+}
+
+int changePassword(const char* user, const char* password)
+{
+    return zephyrUpdatePassword(user, static_cast<uint32_t>(strlen(user)),
+                                password,
+                                static_cast<uint32_t>(strlen(password)));
+}
+
+void runPasswordTests(Bus& bus)
+{
+    std::string err;
+    nlohmann::json store;
+
+    // Password hash: the store keeps the sha256 of the factory password.
+    check(readStore(store) &&
+              storeHash(store, "root") == defaultPasswordHash,
+          "users.json keeps sha256(0penBmc) for root");
+
+    // Password verification, the path bmcweb's PAM shim takes.
+    check(authenticate("root", defaultPassword) == ZEPHYR_PAM_SUCCESS,
+          "authenticate root with the factory password");
+    check(authenticate("root", "not-the-password") == ZEPHYR_PAM_AUTHTOK_ERR,
+          "authenticate root with a wrong password");
+
+    // The failure counter is persisted, and a good login clears it again.
+    check(readStore(store) && storeFailTimes(store, "root") == 1,
+          "wrong password counts as a failed attempt");
+    check(authenticate("root", defaultPassword) == ZEPHYR_PAM_SUCCESS,
+          "correct password after a failed attempt");
+    check(readStore(store) && storeFailTimes(store, "root") == 0,
+          "successful login clears failTimes");
+
+    // A created account starts with the default password.
+    removeIfPresent(bus, passwordUser);
+    check(callManager(bus, managerIface, "CreateUser", userRoot, err,
+                      std::string(passwordUser),
+                      std::vector<std::string>{"web"},
+                      std::string("priv-user"), true),
+          "CreateUser for the password tests");
+    check(readStore(store) &&
+              storeHash(store, passwordUser) == defaultPasswordHash,
+          "new account stores sha256 of the default password");
+    check(authenticate(passwordUser, defaultPassword) == ZEPHYR_PAM_SUCCESS,
+          "new account authenticates with the default password");
+
+    // Password change, the path bmcweb's PATCH Account Password takes.
+    check(changePassword(passwordUser, changedPassword) == ZEPHYR_PAM_SUCCESS,
+          "change the password of the test account");
+    check(authenticate(passwordUser, defaultPassword) ==
+              ZEPHYR_PAM_AUTHTOK_ERR,
+          "old password stops working after the change");
+    check(authenticate(passwordUser, changedPassword) == ZEPHYR_PAM_SUCCESS,
+          "new password works after the change");
+    check(readStore(store) &&
+              storeHash(store, passwordUser) == changedPasswordHash,
+          "password change rewrites passWordHASH");
+    check(changePassword(passwordUser, "short") == ZEPHYR_PAM_AUTHTOK_ERR,
+          "password change enforces minlen");
+
+    // Password expiration: pwdUpdateTime / expireTime in users.json.
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    check(zephyrTestSetPasswordAge(
+              passwordUser, static_cast<uint32_t>(strlen(passwordUser)),
+              now - (2 * 24 * 60 * 60), 1) == 0,
+          "age the test account password");
+    check(authenticate(passwordUser, changedPassword) ==
+              ZEPHYR_PAM_NEW_AUTHTOK_REQD,
+          "expired password asks for a new one");
+    {
+        UserInfo info;
+        std::string e;
+        const bool ok = getUserInfo(bus, passwordUser, info, e);
+        const bool* expired =
+            ok ? infoBool(info, "UserPasswordExpired") : nullptr;
+        check(expired != nullptr && *expired,
+              "GetUserInfo reports UserPasswordExpired");
+    }
+    check(zephyrTestSetPasswordAge(
+              passwordUser, static_cast<uint32_t>(strlen(passwordUser)), now,
+              99999) == 0,
+          "restore the test account password age");
+    check(authenticate(passwordUser, changedPassword) == ZEPHYR_PAM_SUCCESS,
+          "password verifies again once the age is restored");
+
+    check(callManager(bus, deleteIface, "Delete", userPath(passwordUser), err),
+          "delete the password test account");
+}
+
 void runTests(Bus& bus)
 {
     runManagerTests(bus);
+    runPasswordTests(bus);
     runStoreTests();
 }
 
