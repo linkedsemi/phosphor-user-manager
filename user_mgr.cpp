@@ -928,14 +928,16 @@ std::vector<std::string> zephyrCollectGroups()
     }
     return groups;
 }
+} // namespace
 
 // ---------------------------------------------------------------------------
-// Local (users.json) authentication used by other services through the C API
-// in user_mgr_libc.h.  Replaces the Linux PAM stack on Zephyr.
+// Zephyr local authentication.  UserMgr::zephyrAuthenticate() and
+// UserMgr::zephyrUpdatePassword() replace the Linux PAM stack; the C entry
+// points in user_mgr_libc.cpp forward to them.
 // ---------------------------------------------------------------------------
-int zephyrLocalAuthenticate(const std::string& userName,
-                            const std::string& password,
-                            const std::string& loginSource)
+int UserMgr::zephyrAuthenticate(const std::string& userName,
+                                const std::string& password,
+                                const std::string& loginSource)
 {
     json* user = zephyrFindUser(userName);
     if (user == nullptr)
@@ -994,8 +996,8 @@ int zephyrLocalAuthenticate(const std::string& userName,
     return passwordExpired ? ZEPHYR_PAM_NEW_AUTHTOK_REQD : ZEPHYR_PAM_SUCCESS;
 }
 
-int zephyrLocalUpdatePassword(const std::string& userName,
-                              const std::string& newPassword)
+int UserMgr::zephyrUpdatePassword(const std::string& userName,
+                                  const std::string& newPassword)
 {
     json* user = zephyrFindUser(userName);
     if (user == nullptr)
@@ -1019,7 +1021,22 @@ int zephyrLocalUpdatePassword(const std::string& userName,
     (*user)[zephyrJson::lockStatus] = false;
     return zephyrSaveStore() ? ZEPHYR_PAM_SUCCESS : ZEPHYR_PAM_AUTHTOK_ERR;
 }
-} // namespace
+
+#ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
+// Self test only, see user_mgr_libc.h.
+int UserMgr::zephyrSetPasswordAge(const std::string& userName,
+                                  int64_t pwdUpdateTime, int64_t expireTime)
+{
+    json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return -1;
+    }
+    (*user)[zephyrJson::pwdUpdateTime] = pwdUpdateTime;
+    (*user)[zephyrJson::expireTime] = expireTime;
+    return zephyrSaveStore() ? 0 : -1;
+}
+#endif
 
 std::vector<std::string> UserMgr::readAllGroupsOnSystem()
 {
@@ -2668,45 +2685,3 @@ std::vector<std::string> UserMgr::getFailedAttempt(const char* userName)
 
 } // namespace user
 } // namespace phosphor
-
-#ifdef __ZEPHYR__
-// C API used by other services (bmcweb's PAM shim, wolfSSH, ...).
-extern "C" int zephyrAuthenticate(const char* username, uint32_t usernameLen,
-                                  const char* password, uint32_t passwordLen,
-                                  const char* loginSource)
-{
-    return phosphor::user::zephyrLocalAuthenticate(
-        std::string((username != nullptr) ? username : "", usernameLen),
-        std::string((password != nullptr) ? password : "", passwordLen),
-        std::string((loginSource != nullptr) ? loginSource : "web"));
-}
-
-extern "C" int zephyrUpdatePassword(const char* username, uint32_t usernameLen,
-                                    const char* newPassword,
-                                    uint32_t newPasswordLen)
-{
-    return phosphor::user::zephyrLocalUpdatePassword(
-        std::string((username != nullptr) ? username : "", usernameLen),
-        std::string((newPassword != nullptr) ? newPassword : "",
-                    newPasswordLen));
-}
-
-#ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
-// Self test only, see user_mgr_libc.h.
-extern "C" int zephyrTestSetPasswordAge(const char* username,
-                                        uint32_t usernameLen,
-                                        int64_t pwdUpdateTime,
-                                        int64_t expireTime)
-{
-    nlohmann::json* user = phosphor::user::zephyrFindUser(
-        std::string((username != nullptr) ? username : "", usernameLen));
-    if (user == nullptr)
-    {
-        return -1;
-    }
-    (*user)[phosphor::user::zephyrJson::pwdUpdateTime] = pwdUpdateTime;
-    (*user)[phosphor::user::zephyrJson::expireTime] = expireTime;
-    return phosphor::user::zephyrSaveStore() ? 0 : -1;
-}
-#endif
-#endif /* __ZEPHYR__ */

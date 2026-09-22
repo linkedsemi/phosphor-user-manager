@@ -3,17 +3,14 @@ if(CONFIG_PHOSPHOR_USER_MANAGER)
     zephyr_library_sources(
         ${ZEPHYR_CURRENT_MODULE_DIR}/mainapp.cpp
         ${ZEPHYR_CURRENT_MODULE_DIR}/user_mgr.cpp
-        # ${ZEPHYR_CURRENT_MODULE_DIR}/user_mgr_libc.cpp
+        ${ZEPHYR_CURRENT_MODULE_DIR}/user_mgr_libc.cpp
         ${ZEPHYR_CURRENT_MODULE_DIR}/users.cpp
-        # ${ZEPHYR_CURRENT_MODULE_DIR}/user-manager-test.cpp
     )
 
     zephyr_export_include_directories(
         ${ZEPHYR_CURRENT_MODULE_DIR}
     )
-    # zephyr_export_include_directories() only reaches consumers of the
-    # library, so add the root as a plain include dir for our own sources too
-    # (e.g. zephyr/user_manager_selftest.cpp including user_mgr_libc.h).
+
     zephyr_library_include_directories(
         ${ZEPHYR_CURRENT_MODULE_DIR}
     )

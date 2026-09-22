@@ -256,6 +256,50 @@ class UserMgr : public Ifaces
 
     static std::vector<std::string> readAllGroupsOnSystem();
 
+#ifdef __ZEPHYR__
+    /** @brief verify a user password against the local user store
+     *
+     * Zephyr has no PAM stack; the local users.json store is the account
+     * database.  The checks mirror the Linux PAM agents: failed attempt
+     * lockout (deny/unlock_time), password expiration (pwdUpdateTime /
+     * expireTime) and the persisted failure counter.
+     *
+     * @param[in] userName    - name of the user
+     * @param[in] password    - clear text password to verify
+     * @param[in] loginSource - "web", "ipmi", "ssh", ... (logging only)
+     *
+     * @return one of the ZEPHYR_PAM_* codes from user_mgr_libc.h
+     */
+    static int zephyrAuthenticate(const std::string& userName,
+                                  const std::string& password,
+                                  const std::string& loginSource);
+
+    /** @brief change a local user's password
+     *
+     * The new password is checked against the account policy (minlen) and
+     * written to the local store.
+     *
+     * @param[in] userName    - name of the user
+     * @param[in] newPassword - new clear text password
+     *
+     * @return ZEPHYR_PAM_SUCCESS or a ZEPHYR_PAM_* error code
+     */
+    static int zephyrUpdatePassword(const std::string& userName,
+                                    const std::string& newPassword);
+
+#ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
+    /** @brief self test only: rewind a password age
+     *
+     * Lets the self test exercise the expiration path without /etc/shadow,
+     * see user_mgr_libc.h.
+     *
+     * @return 0 on success, -1 for an unknown user or write failure
+     */
+    static int zephyrSetPasswordAge(const std::string& userName,
+                                    int64_t pwdUpdateTime,
+                                    int64_t expireTime);
+#endif
+#endif /* __ZEPHYR__ */
   protected:
     /** @brief get pam argument value
      *  method to get argument value from pam configuration
