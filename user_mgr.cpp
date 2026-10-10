@@ -486,7 +486,7 @@ std::string zephyrAesEncrypt(const std::string& plaintext)
 
 // TODO(zephyr-unhandled): used by the password verification path once the
 // web/ssh/IPMI authentication is wired to the local store.
-[[maybe_unused]] std::string zephyrAesDecrypt(const std::string& ciphertextB64)
+std::string zephyrAesDecrypt(const std::string& ciphertextB64)
 {
     std::string key(zephyrAesKey);
     std::string ciphertext = zephyrBase64Decode(ciphertextB64);
@@ -990,9 +990,13 @@ int UserMgr::zephyrAuthenticate(const std::string& userName,
     }
 
     // Successful login clears the lockout counters.
-    (*user)[zephyrJson::failTimes] = 0;
-    (*user)[zephyrJson::lockStatus] = false;
-    zephyrSaveStore();
+    if ((failTimes != 0) ||
+        zephyrJsonBool(*user, zephyrJson::lockStatus, false))
+    {
+        (*user)[zephyrJson::failTimes] = 0;
+        (*user)[zephyrJson::lockStatus] = false;
+        zephyrSaveStore();
+    }
     return passwordExpired ? ZEPHYR_PAM_NEW_AUTHTOK_REQD : ZEPHYR_PAM_SUCCESS;
 }
 
@@ -1020,6 +1024,16 @@ int UserMgr::zephyrUpdatePassword(const std::string& userName,
     (*user)[zephyrJson::failTimes] = 0;
     (*user)[zephyrJson::lockStatus] = false;
     return zephyrSaveStore() ? ZEPHYR_PAM_SUCCESS : ZEPHYR_PAM_AUTHTOK_ERR;
+}
+
+std::string UserMgr::zephyrGetPassword(const std::string& userName)
+{
+    const json* user = zephyrFindUser(userName);
+    if (user == nullptr)
+    {
+        return {};
+    }
+    return zephyrAesDecrypt(zephyrJsonString(*user, zephyrJson::passWordAes));
 }
 
 #ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST

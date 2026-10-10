@@ -37,6 +37,16 @@ int zephyrAuthenticate(const char* username, uint32_t usernameLen,
 int zephyrUpdatePassword(const char* username, uint32_t usernameLen,
                          const char* newPassword, uint32_t newPasswordLen);
 
+/*
+ * Copy the clear text password of a local user (decrypted from the store)
+ * into out, NUL terminated and truncated to outLen - 1 bytes.  The IPMI LAN
+ * path needs it as the RAKP key.  The caller owns the buffer and must clear
+ * it when done.  Returns the length written, or -1 for an unknown user or a
+ * buffer too small for one character.
+ */
+int zephyrGetPassword(const char* username, uint32_t usernameLen, char* out,
+                      uint32_t outLen);
+
 #ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
 /*
  * Self test only: rewind a user's password age (pwdUpdateTime / expireTime)

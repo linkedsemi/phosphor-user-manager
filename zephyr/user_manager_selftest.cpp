@@ -598,6 +598,15 @@ int changePassword(const char* user, const char* password)
                                 static_cast<uint32_t>(strlen(password)));
 }
 
+std::string storedPassword(const char* user)
+{
+    char buffer[64] = {0};
+    const int len = zephyrGetPassword(user, static_cast<uint32_t>(strlen(user)),
+                                      buffer, sizeof(buffer));
+    return (len > 0) ? std::string(buffer, static_cast<size_t>(len))
+                     : std::string{};
+}
+
 void runPasswordTests(Bus& bus)
 {
     std::string err;
@@ -607,6 +616,8 @@ void runPasswordTests(Bus& bus)
     check(readStore(store) &&
               storeHash(store, "root") == defaultPasswordHash,
           "users.json keeps sha256(0penBmc) for root");
+    check(storedPassword("root") == defaultPassword,
+          "passWordAES of root decrypts to 0penBmc");
 
     // Password verification, the path bmcweb's PAM shim takes.
     check(authenticate("root", defaultPassword) == ZEPHYR_PAM_SUCCESS,
@@ -632,6 +643,8 @@ void runPasswordTests(Bus& bus)
     check(readStore(store) &&
               storeHash(store, passwordUser) == defaultPasswordHash,
           "new account stores sha256 of the default password");
+    check(storedPassword(passwordUser) == defaultPassword,
+          "new account stores the default password for RAKP");
     check(authenticate(passwordUser, defaultPassword) == ZEPHYR_PAM_SUCCESS,
           "new account authenticates with the default password");
 
@@ -646,6 +659,10 @@ void runPasswordTests(Bus& bus)
     check(readStore(store) &&
               storeHash(store, passwordUser) == changedPasswordHash,
           "password change rewrites passWordHASH");
+    check(storedPassword(passwordUser) == changedPassword,
+          "clear text password follows a password change");
+    check(storedPassword("ut_no_such_user").empty(),
+          "unknown user has no clear text password");
     check(changePassword(passwordUser, "short") == ZEPHYR_PAM_AUTHTOK_ERR,
           "password change enforces minlen");
 

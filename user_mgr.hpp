@@ -287,6 +287,17 @@ class UserMgr : public Ifaces
     static int zephyrUpdatePassword(const std::string& userName,
                                     const std::string& newPassword);
 
+    /** @brief clear text password of a local user
+     *
+     * Decrypted from the local store; the IPMI LAN path needs the password
+     * as the RAKP key.  Returns an empty string for unknown users.
+     *
+     * @param[in] userName - name of the user
+     *
+     * @return the password, or "" if the user has no entry
+     */
+    static std::string zephyrGetPassword(const std::string& userName);
+
 #ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
     /** @brief self test only: rewind a password age
      *

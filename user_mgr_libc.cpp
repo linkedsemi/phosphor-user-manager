@@ -14,6 +14,8 @@
 
 #include "user_mgr.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <string>
 
 namespace
@@ -38,6 +40,28 @@ int zephyrUpdatePassword(const char* username, uint32_t usernameLen,
 {
     return phosphor::user::UserMgr::zephyrUpdatePassword(
         toString(username, usernameLen), toString(newPassword, newPasswordLen));
+}
+
+int zephyrGetPassword(const char* username, uint32_t usernameLen, char* out,
+                      uint32_t outLen)
+{
+    if ((out == nullptr) || (outLen == 0))
+    {
+        return -1;
+    }
+
+    const std::string password =
+        phosphor::user::UserMgr::zephyrGetPassword(toString(username, usernameLen));
+    if (password.empty())
+    {
+        return -1;
+    }
+
+    const size_t copyLen =
+        std::min(static_cast<size_t>(outLen - 1), password.size());
+    std::memcpy(out, password.data(), copyLen);
+    out[copyLen] = '\0';
+    return static_cast<int>(copyLen);
 }
 
 #ifdef CONFIG_PHOSPHOR_USER_MANAGER_SELFTEST
