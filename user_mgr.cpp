@@ -1023,7 +1023,13 @@ int UserMgr::zephyrUpdatePassword(const std::string& userName,
     (*user)[zephyrJson::pwdUpdateTime] = static_cast<int64_t>(std::time(nullptr));
     (*user)[zephyrJson::failTimes] = 0;
     (*user)[zephyrJson::lockStatus] = false;
-    return zephyrSaveStore() ? ZEPHYR_PAM_SUCCESS : ZEPHYR_PAM_AUTHTOK_ERR;
+    const bool saved = zephyrSaveStore();
+    if (!saved)
+    {
+        lg2::error("Failed to save the local user store for '{USERNAME}'",
+                   "USERNAME", userName);
+    }
+    return saved ? ZEPHYR_PAM_SUCCESS : ZEPHYR_PAM_AUTHTOK_ERR;
 }
 
 std::string UserMgr::zephyrGetPassword(const std::string& userName)
